@@ -44,6 +44,10 @@ from emissiongraph.narrative.generator import generate_narrative_sync, get_templ
 from emissiongraph.narrative.validator import validate_narrative
 from emissiongraph.registry.factors import get_fuel_registry
 
+from fastapi import APIRouter
+
+# All API routes go on this router, mounted at both / and /api
+api = APIRouter()
 app = FastAPI(title="EmissionGraph Compute", version="0.1.0")
 
 # In-memory stores for MVP (Convex is the real persistence layer)
@@ -114,14 +118,14 @@ class NarrativeResponse(BaseModel):
 
 # --- Health check ---
 
-@app.get("/health")
+@api.get("/health")
 async def health():
     return {"status": "ok", "service": "emissiongraph-compute"}
 
 
 # --- Ingestion ---
 
-@app.post("/ingest/workbook", response_model=IngestResponse)
+@api.post("/ingest/workbook", response_model=IngestResponse)
 async def ingest_workbook(
     file: UploadFile = File(...),
     port_id: str = "P1",
@@ -193,7 +197,7 @@ async def ingest_workbook(
 
 # --- Graph Build ---
 
-@app.post("/graph/build", response_model=GraphBuildResponse)
+@api.post("/graph/build", response_model=GraphBuildResponse)
 async def build_port_graph(req: GraphBuildRequest):
     """Build the emissions graph for a port/FY from headline metrics."""
     key = f"{req.port_id}:{req.fy}"
@@ -273,7 +277,7 @@ def _get_fact_hash(port_ids: list[str], fys: list[str]) -> str:
     return hashlib.sha256(json.dumps(all_ids).encode()).hexdigest()
 
 
-@app.post("/attribution/spatial")
+@api.post("/attribution/spatial")
 async def attribution_spatial(req: SpatialRequest):
     """Run spatial attribution comparing two ports."""
     G = _get_combined_graph([req.port_a, req.port_b], [req.fy])
@@ -288,7 +292,7 @@ async def attribution_spatial(req: SpatialRequest):
     return result
 
 
-@app.post("/attribution/temporal")
+@api.post("/attribution/temporal")
 async def attribution_temporal(req: TemporalRequest):
     """Run temporal attribution for a port across two periods."""
     G = _get_combined_graph([req.port], [req.fy_a, req.fy_b])
@@ -303,7 +307,7 @@ async def attribution_temporal(req: TemporalRequest):
     return result
 
 
-@app.post("/attribution/fleet")
+@api.post("/attribution/fleet")
 async def attribution_fleet(req: FleetRequest):
     """Run fleet-level ranking for all ports in a period."""
     # Collect all ports that have data for this FY
@@ -327,7 +331,7 @@ async def attribution_fleet(req: FleetRequest):
 
 # --- Narrative ---
 
-@app.post("/narrative/generate", response_model=NarrativeResponse)
+@api.post("/narrative/generate", response_model=NarrativeResponse)
 async def generate_narrative_endpoint(req: NarrativeRequest):
     """Generate a validated narrative for an attribution tree."""
     tree = _attribution_cache.get(req.tree_hash)
@@ -361,7 +365,7 @@ async def generate_narrative_endpoint(req: NarrativeRequest):
 
 # --- Audit Trace ---
 
-@app.get("/audit/trace/{run_id}")
+@api.get("/audit/trace/{run_id}")
 async def audit_trace(run_id: str):
     """Get the full provenance chain for an attribution run."""
     tree = _attribution_cache.get(run_id)
@@ -381,7 +385,7 @@ async def audit_trace(run_id: str):
 
 # --- Debug: inspect workbook structure ---
 
-@app.post("/debug/workbook-headers")
+@api.post("/debug/workbook-headers")
 async def debug_workbook_headers(
     file: UploadFile = File(...),
 ):
@@ -411,7 +415,7 @@ async def debug_workbook_headers(
 
 # --- Convenience: list available data ---
 
-@app.get("/data/ports")
+@api.get("/data/ports")
 async def list_ports():
     """List all ports with ingested data."""
     ports: dict[str, list[str]] = {}
@@ -433,7 +437,7 @@ class QueryResponse(BaseModel):
     context_used: list[str]
 
 
-@app.post("/query", response_model=QueryResponse)
+@api.post("/query", response_model=QueryResponse)
 async def query_llm(req: QueryRequest):
     """Ask a free-form question about the emissions data.
 
@@ -561,3 +565,27 @@ async def query_llm(req: QueryRequest):
         answer=response.choices[0].message.content,
         context_used=port_ids,
     )
+
+
+# --- Mount API router at both / (direct) and /api (frontend proxy/production) ---
+app.include_router(api)
+app.include_router(api, prefix="/api")
+
+# --- Static file serving for production (frontend build) ---
+import pathlib
+_static_dir = pathlib.Path(__file__).resolve().parent.parent.parent.parent / "frontend" / "dist"
+if _static_dir.exists():
+    from starlette.staticfiles import StaticFiles
+    from starlette.responses import FileResponse
+
+    app.mount("/assets", StaticFiles(directory=_static_dir / "assets"), name="static-assets")
+
+    @app.get("/{path:path}")
+    async def serve_spa(path: str):
+        """Serve frontend SPA — catch-all after API routes."""
+        if path.startswith("api/"):
+            raise HTTPException(404)
+        file = _static_dir / path
+        if file.exists() and file.is_file():
+            return FileResponse(file)
+        return FileResponse(_static_dir / "index.html")

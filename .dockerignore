@@ -1,0 +1,9 @@
+node_modules
+frontend/node_modules
+compute/venv
+__pycache__
+*.pyc
+.env
+.git
+.code-review-graph
+.claude

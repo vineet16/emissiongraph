@@ -1,0 +1,17 @@
+{
+  "name": "emissiongraph",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev:convex": "npx convex dev",
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev:compute": "cd compute && uvicorn emissiongraph.api.routes:app --reload --port 8000",
+    "dev": "concurrently \"npm run dev:convex\" \"npm run dev:frontend\" \"npm run dev:compute\""
+  },
+  "dependencies": {
+    "convex": "^1.16.0"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

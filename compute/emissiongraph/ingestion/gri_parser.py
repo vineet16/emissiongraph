@@ -1,158 +1,191 @@
 """GRI sheet parsers for 302-1, 305-1, 305-2, 305-4.
 
-Key rules from spec:
-1. Cell-level provenance mandatory — every Measurement carries exact (sheet, cell).
-2. Computed totals are NOT parsed as facts — recomputed downstream.
-3. Annual-only sources (HFCs, Acetylene) carry period="annual".
-4. Zero rows still emit Measurements for completeness.
-5. Cross-sheet dedup: same fuel quantity appearing in 302-1/305-1/305-2
-   is ONE underlying measurement. Dedup key: (port_id, fy, month, fuel_type, sub_type).
+Actual workbook layout — multi-section horizontal:
+  Row 3: Section headers across columns:
+         B="Electricity Consumed", G="Diesel Consumed", L="Petrol Consumed",
+         O="HFHSD & IFO Consumed", R="Other Fuels"
+  Row 4: Sub-headers per section (Month, units, etc.)
+  Row 5: FY label row
+  Rows 6-17: Monthly data (datetime in date col, values in data cols)
+  Row 18: "Total" row
+  Rows 19+: Summary/derived rows (emissions, intensity, etc.)
+
+Each section has its own date column + data columns.
+"Other Fuels" section is a vertical list (Type, Quantity, GJ/tCO2) not a time series.
 """
 
 from __future__ import annotations
+
+from datetime import datetime
 
 from openpyxl.worksheet.worksheet import Worksheet
 from openpyxl.workbook import Workbook
 
 from emissiongraph.facts.schema import AmbiguousTotalWarning, CellRef, Measurement
-from emissiongraph.ingestion.workbook_loader import get_sheet
 from emissiongraph.ingestion.cargo_parser import (
-    MONTH_NAMES,
-    FY_MONTH_MAP,
     _col_letter,
-    _fy_to_start_year,
-    _month_to_period_value,
+    _datetime_to_period_value,
 )
 
-# Fuel type normalization map — maps common variations to canonical names
-FUEL_NORMALIZE: dict[str, str] = {
-    "electricity": "Electricity",
-    "purchased electricity": "Electricity",
-    "grid electricity": "Electricity",
-    "diesel": "Diesel",
-    "hsd": "Diesel",
-    "high speed diesel": "Diesel",
-    "diesel (stationary eqp)": "Diesel",
-    "diesel (stationary eqp.)": "Diesel",
-    "diesel (mobile eqp)": "Diesel",
-    "diesel (mobile eqp.)": "Diesel",
-    "petrol": "Petrol",
-    "motor spirit": "Petrol",
-    "petrol (mobile eqp)": "Petrol",
-    "petrol (mobile eqp.)": "Petrol",
-    "furnace oil": "Furnace Oil",
-    "fo": "Furnace Oil",
-    "lpg": "LPG",
-    "coal": "Coal",
-    "hfc": "HFC",
-    "hfcs": "HFC",
-    "r-410a": "HFC",
-    "refrigerant": "HFC",
-    "acetylene": "Acetylene",
-    "biodiesel": "Biodiesel",
-}
 
-# Fuels that are annual-only (no monthly breakdown available)
-ANNUAL_ONLY_FUELS = {"HFC", "Acetylene"}
-
-# Fuels with sub_type disambiguation
-DIESEL_SUBTYPES = {
-    "diesel (stationary eqp)": "stationary",
-    "diesel (stationary eqp.)": "stationary",
-    "diesel (mobile eqp)": "mobile",
-    "diesel (mobile eqp.)": "mobile",
-}
-
-PETROL_SUBTYPES = {
-    "petrol (mobile eqp)": "mobile",
-    "petrol (mobile eqp.)": "mobile",
-}
-
-# Unit detection
-UNIT_HINTS = {
-    "Electricity": "MWH",
-    "Diesel": "KL",
-    "Petrol": "KL",
-    "Furnace Oil": "KL",
-    "LPG": "T",
-    "Coal": "T",
-    "HFC": "Kg",
-    "Acetylene": "Kg",
-    "Biodiesel": "KL",
-}
+# Section definitions: maps section header patterns to fuel type + extraction info
+SECTION_DEFS = [
+    {
+        "header_pattern": "electricity consumed",
+        "fuel_type": "Electricity",
+        "unit": "MWH",
+        # Columns relative to the section's date column:
+        # We extract specific named columns from row 4 headers
+        "columns": {
+            "thermal": ("Electricity", "thermal", "MWH"),
+            "re": ("Electricity", "renewable", "MWH"),
+            "total": ("Electricity", None, "MWH"),
+        },
+        # Note: matching is substring-based within section boundaries.
+        # P4 has multi-source layout: Thermal(1)/RE(1)/Total(1)/Thermal(2)/RE(2)/Total(2)
+        # The parser picks the last match per pattern, which gives us source (2) or the combined total.
+    },
+    {
+        "header_pattern": "diesel consumed",
+        "fuel_type": "Diesel",
+        "unit": "KL",
+        "columns": {
+            "stationary eqp": ("Diesel", "stationary", "KL"),
+            "mobile eqp": ("Diesel", "mobile", "KL"),
+            "total qty": ("Diesel", None, "KL"),
+        },
+    },
+    {
+        "header_pattern": "petrol consumed",
+        "fuel_type": "Petrol",
+        "unit": "KL",
+        "columns": {
+            "total qty": ("Petrol", None, "KL"),
+        },
+    },
+    {
+        "header_pattern": "hfhsd",
+        "fuel_type": "HFHSD",
+        "unit": "KL",
+        "columns": {
+            "total qty": ("HFHSD", None, "KL"),
+        },
+    },
+]
 
 
-def _normalize_fuel(raw_label: str) -> tuple[str, str | None]:
-    """Normalize a fuel label to (canonical_fuel_type, sub_type)."""
-    lower = raw_label.strip().lower()
+def _find_section_boundaries(ws: Worksheet) -> list[int]:
+    """Find the start column of each section from row 3 headers.
 
-    # Check diesel subtypes first
-    for key, sub in DIESEL_SUBTYPES.items():
-        if lower == key:
-            return "Diesel", sub
-
-    # Check petrol subtypes
-    for key, sub in PETROL_SUBTYPES.items():
-        if lower == key:
-            return "Petrol", sub
-
-    # General normalization
-    canonical = FUEL_NORMALIZE.get(lower)
-    if canonical:
-        return canonical, None
-
-    # Fuzzy: check if any key is a substring
-    for key, canonical in FUEL_NORMALIZE.items():
-        if key in lower:
-            return canonical, None
-
-    # Unknown fuel — return as-is
-    return raw_label.strip(), None
+    Returns sorted list of 1-based column indices where sections begin.
+    """
+    boundaries = []
+    for col_idx in range(1, (ws.max_column or 30) + 1):
+        val = ws.cell(row=3, column=col_idx).value
+        if val and isinstance(val, str) and val.strip():
+            boundaries.append(col_idx)
+    return sorted(boundaries)
 
 
-def _detect_unit(fuel_type: str, header_text: str | None = None) -> str:
-    """Detect the measurement unit for a fuel type."""
-    if header_text:
-        h = header_text.upper()
-        for unit in ["MWH", "KL", "MT", "T", "KG"]:
-            if unit in h:
-                return unit
-    return UNIT_HINTS.get(fuel_type, "T")
+def _find_sections(ws: Worksheet) -> list[dict]:
+    """Scan row 3 for section headers and row 4 for column sub-headers.
+
+    Returns a list of section dicts with:
+      - fuel_type, unit
+      - date_col: 1-based column index for the "Month" column
+      - data_cols: list of (col_idx, fuel_type, sub_type, unit)
+    """
+    sections = []
+    boundaries = _find_section_boundaries(ws)
+    sub_header_row = 4
+
+    for b_idx, col_idx in enumerate(boundaries):
+        val = ws.cell(row=3, column=col_idx).value
+        if not val or not isinstance(val, str):
+            continue
+
+        val_lower = val.strip().lower()
+
+        # Determine the end of this section (start of next section, or max_column)
+        if b_idx + 1 < len(boundaries):
+            section_end = boundaries[b_idx + 1]
+        else:
+            section_end = (ws.max_column or 30) + 1
+
+        for sdef in SECTION_DEFS:
+            if sdef["header_pattern"] in val_lower:
+                date_col = None
+                data_cols = []
+
+                # Scan only within this section's boundaries
+                for sc in range(col_idx, section_end):
+                    sub_val = ws.cell(row=sub_header_row, column=sc).value
+                    if not sub_val or not isinstance(sub_val, str):
+                        continue
+                    sub_lower = sub_val.strip().lower()
+
+                    if sub_lower == "month":
+                        date_col = sc
+                    else:
+                        for pattern, (ft, st, unit) in sdef["columns"].items():
+                            if pattern in sub_lower:
+                                data_cols.append((sc, ft, st, unit))
+                                break
+
+                if date_col and data_cols:
+                    sections.append({
+                        "fuel_type": sdef["fuel_type"],
+                        "date_col": date_col,
+                        "data_cols": data_cols,
+                    })
+                break
+
+    return sections
 
 
-def _find_month_columns(ws: Worksheet, max_scan_rows: int = 10) -> tuple[int | None, dict[str, int]]:
-    """Scan the first rows to find the header row and month column mapping."""
-    for row_idx in range(1, max_scan_rows + 1):
-        month_cols: dict[str, int] = {}
-        for col_idx in range(1, (ws.max_column or 30) + 1):
-            val = ws.cell(row=row_idx, column=col_idx).value
-            if val and isinstance(val, str):
-                normalized = val.strip().lower()
-                if normalized in MONTH_NAMES:
-                    month_cols[normalized] = col_idx
-        if len(month_cols) >= 6:  # at least half the months found
-            return row_idx, month_cols
-    return None, {}
+def _find_other_fuels_section(ws: Worksheet) -> dict | None:
+    """Find the 'Other Fuels' section which has a vertical Type/Quantity layout."""
+    header_row = 3
+    sub_header_row = 4
 
-
-def _find_annual_column(ws: Worksheet, header_row: int) -> int | None:
-    """Find the 'Total' or 'Annual' column in the header row."""
     for col_idx in range(1, (ws.max_column or 30) + 1):
         val = ws.cell(row=header_row, column=col_idx).value
-        if val and isinstance(val, str):
-            lower = val.strip().lower()
-            if lower in ("total", "annual", "yearly", "fy total"):
-                return col_idx
+        if val and isinstance(val, str) and "other fuels" in val.strip().lower():
+            # Find Type, Quantity, GJ/tCO2 columns
+            type_col = None
+            qty_col = None
+            value_col = None
+
+            for sc in range(col_idx, min(col_idx + 5, (ws.max_column or 30) + 1)):
+                sub_val = ws.cell(row=sub_header_row, column=sc).value
+                if not sub_val or not isinstance(sub_val, str):
+                    continue
+                sub_lower = sub_val.strip().lower()
+                if sub_lower == "type":
+                    type_col = sc
+                elif "quantity" in sub_lower:
+                    qty_col = sc
+                elif sub_lower in ("gj", "tco2"):
+                    value_col = sc
+
+            if type_col and (qty_col or value_col):
+                return {
+                    "type_col": type_col,
+                    "qty_col": qty_col,
+                    "value_col": value_col,
+                }
     return None
 
 
-def _is_total_row(label: str) -> bool:
-    """Check if a row label indicates a computed total."""
-    lower = label.strip().lower()
-    return any(kw in lower for kw in [
-        "total", "sub-total", "subtotal", "grand total",
-        "scope 1", "scope 2", "scope 1+2",
-    ])
+# Fuel type normalization for "Other Fuels" entries
+OTHER_FUEL_NORMALIZE = {
+    "acetylene": ("Acetylene", "Kg"),
+    "lpg": ("LPG", "T"),
+    "coal": ("Coal", "T"),
+    "hfcs": ("HFC", "Kg"),
+    "hfc": ("HFC", "Kg"),
+    "co2 fire extinguisher": ("CO2_Extinguisher", "Kg"),
+}
 
 
 def parse_energy_sheet(
@@ -162,119 +195,83 @@ def parse_energy_sheet(
     workbook_name: str,
     sheet_name: str = "302-1",
 ) -> tuple[list[Measurement], list[AmbiguousTotalWarning]]:
-    """Parse GRI 302-1 energy consumption sheet.
+    """Parse a GRI sheet with multi-section horizontal layout.
 
-    Returns (measurements, warnings).
+    Works for 302-1, 305-1, 305-2, 305-4.
     """
     measurements: list[Measurement] = []
     warnings: list[AmbiguousTotalWarning] = []
 
-    header_row, month_cols = _find_month_columns(ws)
-    if header_row is None:
-        return measurements, warnings
+    sections = _find_sections(ws)
 
-    annual_col = _find_annual_column(ws, header_row)
+    # Parse monthly data for each section
+    for section in sections:
+        date_col = section["date_col"]
 
-    # Parse data rows below header
-    for row_idx in range(header_row + 1, (ws.max_row or 100) + 1):
-        label_cell = ws.cell(row=row_idx, column=1).value
-        if label_cell is None:
-            continue
-        label = str(label_cell).strip()
-        if not label:
-            continue
+        # Find data rows: start after FY label row, stop at Total
+        data_start = None
+        data_end = None
 
-        # Skip total rows — we verify them but don't store as facts
-        if _is_total_row(label):
-            # Verify total if annual column exists
-            if annual_col:
-                parsed_total_val = ws.cell(row=row_idx, column=annual_col).value
-                if parsed_total_val is not None:
+        for row_idx in range(5, (ws.max_row or 50) + 1):
+            date_cell = ws.cell(row=row_idx, column=date_col).value
+
+            if date_cell is None:
+                continue
+
+            # Skip FY label row
+            if isinstance(date_cell, str) and date_cell.strip().upper().startswith("FY"):
+                continue
+
+            # Stop at Total
+            if isinstance(date_cell, str) and "total" in date_cell.strip().lower():
+                data_end = row_idx
+                break
+
+            # First datetime = data start
+            if data_start is None:
+                if isinstance(date_cell, datetime):
+                    data_start = row_idx
+                elif isinstance(date_cell, str):
                     try:
-                        parsed_total = float(parsed_total_val)
-                        # Sum the monthly values we've seen for verification
-                        row_sum = 0.0
-                        for _, col_idx in month_cols.items():
-                            v = ws.cell(row=row_idx, column=col_idx).value
-                            if v is not None:
-                                try:
-                                    row_sum += float(v)
-                                except (ValueError, TypeError):
-                                    pass
-                        if parsed_total != 0 and abs(row_sum - parsed_total) / abs(parsed_total) > 0.005:
-                            warnings.append(AmbiguousTotalWarning(
-                                sheet=sheet_name,
-                                row_label=label,
-                                parsed_total=parsed_total,
-                                computed_total=row_sum,
-                                pct_diff=abs(row_sum - parsed_total) / abs(parsed_total) * 100,
-                            ))
-                    except (ValueError, TypeError):
-                        pass
-            continue
-
-        fuel_type, sub_type = _normalize_fuel(label)
-        unit = _detect_unit(fuel_type)
-        is_annual = fuel_type in ANNUAL_ONLY_FUELS
-
-        if is_annual:
-            # Annual-only: try annual column or sum of monthly
-            annual_val = None
-            if annual_col:
-                v = ws.cell(row=row_idx, column=annual_col).value
-                if v is not None:
-                    try:
-                        annual_val = float(v)
-                    except (ValueError, TypeError):
-                        pass
-            if annual_val is None:
-                # Sum monthly values
-                annual_val = 0.0
-                for _, col_idx in month_cols.items():
-                    v = ws.cell(row=row_idx, column=col_idx).value
-                    if v is not None:
-                        try:
-                            annual_val += float(v)
-                        except (ValueError, TypeError):
-                            pass
-
-            col_for_ref = annual_col or 1
-            measurements.append(Measurement(
-                port_id=port_id,
-                fy=fy,
-                period="annual",
-                period_value=fy,
-                fuel_type=fuel_type,
-                sub_type=sub_type,
-                measure="fugitive_release" if fuel_type == "HFC" else "consumption",
-                quantity=annual_val,
-                unit=unit,
-                source_cell=CellRef(
-                    workbook=workbook_name,
-                    sheet=sheet_name,
-                    cell=f"{_col_letter(col_for_ref)}{row_idx}",
-                    row=row_idx,
-                    col=col_for_ref,
-                ),
-            ))
-        else:
-            # Monthly: extract each month
-            for month_name, col_idx in month_cols.items():
-                cell = ws.cell(row=row_idx, column=col_idx)
-                val = cell.value
-                # Zero rows still emit measurements per spec rule 4
-                qty = 0.0
-                if val is not None:
-                    try:
-                        qty = float(val)
-                    except (ValueError, TypeError):
+                        datetime.fromisoformat(date_cell.split(" ")[0])
+                        data_start = row_idx
+                    except (ValueError, IndexError):
                         continue
 
-                period_value = _month_to_period_value(month_name, fy)
-                if not period_value:
+        if data_start is None:
+            continue
+        if data_end is None:
+            data_end = min(data_start + 12, (ws.max_row or 50) + 1)
+
+        # Extract measurements for each data column
+        for col_idx, fuel_type, sub_type, unit in section["data_cols"]:
+            for row_idx in range(data_start, data_end):
+                date_cell = ws.cell(row=row_idx, column=date_col).value
+
+                # Parse datetime
+                if isinstance(date_cell, datetime):
+                    period_value = _datetime_to_period_value(date_cell)
+                elif isinstance(date_cell, str):
+                    try:
+                        dt = datetime.fromisoformat(date_cell.split(" ")[0])
+                        period_value = _datetime_to_period_value(dt)
+                    except (ValueError, IndexError):
+                        continue
+                else:
                     continue
 
-                col_letter = _col_letter(col_idx)
+                # Parse value
+                val_cell = ws.cell(row=row_idx, column=col_idx).value
+                qty = 0.0
+                if val_cell is not None:
+                    if isinstance(val_cell, str) and val_cell.strip() == "-":
+                        qty = 0.0
+                    else:
+                        try:
+                            qty = float(val_cell)
+                        except (ValueError, TypeError):
+                            continue
+
                 measurements.append(Measurement(
                     port_id=port_id,
                     fy=fy,
@@ -288,11 +285,69 @@ def parse_energy_sheet(
                     source_cell=CellRef(
                         workbook=workbook_name,
                         sheet=sheet_name,
-                        cell=f"{col_letter}{row_idx}",
+                        cell=f"{_col_letter(col_idx)}{row_idx}",
                         row=row_idx,
                         col=col_idx,
                     ),
                 ))
+
+    # Parse "Other Fuels" section (vertical type list, annual values)
+    other = _find_other_fuels_section(ws)
+    if other:
+        type_col = other["type_col"]
+        qty_col = other.get("qty_col")
+        value_col = other.get("value_col")
+
+        for row_idx in range(5, (ws.max_row or 30) + 1):
+            type_cell = ws.cell(row=row_idx, column=type_col).value
+            if not type_cell or not isinstance(type_cell, str):
+                continue
+
+            type_lower = type_cell.strip().lower()
+
+            # Skip header-like rows and total rows
+            if type_lower in ("type", "") or "total" in type_lower or "energy" in type_lower:
+                continue
+
+            # Normalize fuel type
+            normalized = OTHER_FUEL_NORMALIZE.get(type_lower)
+            if normalized:
+                fuel_type, unit = normalized
+            else:
+                fuel_type = type_cell.strip()
+                unit = "T"
+
+            # Get quantity
+            read_col = qty_col or value_col
+            if not read_col:
+                continue
+
+            val = ws.cell(row=row_idx, column=read_col).value
+            qty = 0.0
+            if val is not None:
+                try:
+                    qty = float(val)
+                except (ValueError, TypeError):
+                    continue
+
+            measurements.append(Measurement(
+                port_id=port_id,
+                fy=fy,
+                period="annual",
+                period_value=fy,
+                fuel_type=fuel_type,
+                sub_type=None,
+                measure="consumption",
+                quantity=qty,
+                unit=unit,
+                source_cell=CellRef(
+                    workbook=workbook_name,
+                    sheet=sheet_name,
+                    cell=f"{_col_letter(read_col)}{row_idx}",
+                    row=row_idx,
+                    col=read_col,
+                ),
+            ))
 
     return measurements, warnings
 
@@ -302,18 +357,14 @@ def parse_emissions_sheet(
     port_id: str,
     fy: str,
     workbook_name: str,
-    sheet_name: str,  # "305-1" or "305-2"
-    scope: str,  # "scope1" or "scope2"
+    sheet_name: str,
+    scope: str,
 ) -> tuple[list[Measurement], list[AmbiguousTotalWarning]]:
     """Parse GRI 305-1 (Scope 1) or 305-2 (Scope 2) emissions sheets.
 
-    These sheets share fuel-quantity columns with 302-1. Per spec, the same
-    fuel quantity appearing in multiple sheets is ONE underlying measurement.
-    We parse the emission values (tCO2e) here — fuel consumption is parsed from 302-1.
+    Same multi-section layout as 302-1. We parse the consumption quantities;
+    emission totals in rows 19+ are derived values we don't store as facts.
     """
-    # For 305-1/305-2, the structure is similar to 302-1 but values are in tCO2e
-    # We parse them as separate measurements with a different semantic meaning
-    # The deduplication happens at the Measurement ID level via the deterministic UUID5
     return parse_energy_sheet(ws, port_id, fy, workbook_name, sheet_name)
 
 
@@ -325,69 +376,10 @@ def parse_intensity_sheet(
 ) -> tuple[list[Measurement], list[AmbiguousTotalWarning]]:
     """Parse GRI 305-4 intensity metrics sheet.
 
-    305-4 contains combined intensity (tCO2e per MT, GJ per MT).
-    These are computed values — we parse them for verification but mark as INFERRED.
+    Same layout — we parse consumption data. Intensity metrics in summary rows
+    are derived values verified downstream.
     """
-    measurements: list[Measurement] = []
-    warnings: list[AmbiguousTotalWarning] = []
-
-    header_row, month_cols = _find_month_columns(ws)
-    if header_row is None:
-        return measurements, warnings
-
-    for row_idx in range(header_row + 1, (ws.max_row or 100) + 1):
-        label_cell = ws.cell(row=row_idx, column=1).value
-        if label_cell is None:
-            continue
-        label = str(label_cell).strip()
-        if not label:
-            continue
-
-        lower = label.lower()
-        # Detect intensity metric type
-        if "co2" in lower or "emission" in lower:
-            fuel_type = "EmissionIntensity"
-            unit = "tCO2e/MT"
-        elif "energy" in lower or "gj" in lower:
-            fuel_type = "EnergyIntensity"
-            unit = "GJ/MT"
-        else:
-            continue
-
-        for month_name, col_idx in month_cols.items():
-            val = ws.cell(row=row_idx, column=col_idx).value
-            if val is None:
-                continue
-            try:
-                qty = float(val)
-            except (ValueError, TypeError):
-                continue
-
-            period_value = _month_to_period_value(month_name, fy)
-            if not period_value:
-                continue
-
-            measurements.append(Measurement(
-                port_id=port_id,
-                fy=fy,
-                period="monthly",
-                period_value=period_value,
-                fuel_type=fuel_type,
-                sub_type=None,
-                measure="consumption",
-                quantity=qty,
-                unit=unit,
-                source_cell=CellRef(
-                    workbook=workbook_name,
-                    sheet="305-4",
-                    cell=f"{_col_letter(col_idx)}{row_idx}",
-                    row=row_idx,
-                    col=col_idx,
-                ),
-                confidence="INFERRED",
-            ))
-
-    return measurements, warnings
+    return parse_energy_sheet(ws, port_id, fy, workbook_name, "305-4")
 
 
 def parse_workbook(
@@ -399,17 +391,15 @@ def parse_workbook(
     """Parse all GRI sheets from a workbook, deduplicating across sheets.
 
     Deduplication key: (port_id, fy, period_value, fuel_type, sub_type).
-    The deterministic UUID5 on Measurement handles this automatically —
-    two measurements with the same key produce the same ID, and dict keying
-    deduplicates.
+    The deterministic UUID5 on Measurement handles this automatically.
     """
-    all_measurements: dict[str, Measurement] = {}  # id -> Measurement (dedup)
+    all_measurements: dict[str, Measurement] = {}
     all_warnings: list[AmbiguousTotalWarning] = []
 
-    # Parse Cargo Handled
     from emissiongraph.ingestion.cargo_parser import parse_cargo_sheet
     from emissiongraph.ingestion.workbook_loader import get_sheet
 
+    # Parse Cargo Handled
     cargo_ws = get_sheet(wb, "Cargo Handled")
     if cargo_ws:
         for m in parse_cargo_sheet(cargo_ws, port_id, fy, workbook_name):
@@ -428,7 +418,6 @@ def parse_workbook(
     if scope1_ws:
         ms, ws_ = parse_emissions_sheet(scope1_ws, port_id, fy, workbook_name, "305-1", "scope1")
         for m in ms:
-            # Only add if not already present from 302-1 (dedup via ID)
             if m.id not in all_measurements:
                 all_measurements[m.id] = m
         all_warnings.extend(ws_)

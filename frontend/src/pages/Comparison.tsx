@@ -44,7 +44,7 @@ export default function Comparison() {
       .then((t) => {
         setTree(t);
         // Try to get narrative
-        return getNarrative(t.graph_hash).catch(() => null);
+        return getNarrative((t as any).tree_hash).catch(() => null);
       })
       .then((n) => {
         if (n) setNarrative(n);

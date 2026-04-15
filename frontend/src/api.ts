@@ -135,3 +135,14 @@ export async function buildGraph(
     body: JSON.stringify({ port_id: portId, fy }),
   });
 }
+
+export async function queryLLM(
+  question: string,
+  fy: string = "FY24-25"
+): Promise<{ answer: string; context_used: string[] }> {
+  return fetchJson(`${BASE}/query`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question, fy }),
+  });
+}

@@ -37,31 +37,35 @@ async def generate_narrative(
     tree: AttributionTree,
     api_key: str | None = None,
 ) -> tuple[str, ValidationResult]:
-    """Generate a narrative for an attribution tree using Claude.
+    """Generate a narrative for an attribution tree using Groq.
 
     Returns (narrative_text, validation_result).
     On validation failure after MAX_RETRIES, returns empty string with failure result.
     """
-    import anthropic
+    from openai import OpenAI
 
-    client = anthropic.Anthropic(api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"))
+    client = OpenAI(
+        api_key=api_key or os.environ.get("GROQ_API_KEY"),
+        base_url="https://api.groq.com/openai/v1",
+    )
     prompt = _render_prompt(tree)
 
     for attempt in range(MAX_RETRIES):
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
             max_tokens=1024,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
         )
 
-        narrative = response.content[0].text
+        narrative = response.choices[0].message.content
         result = validate_narrative(narrative, tree)
 
         if result.ok:
             return narrative, result
 
-        # Retry with feedback about the failure
         prompt = (
             f"{prompt}\n\n"
             f"VALIDATION FAILED (attempt {attempt + 1}): {result.reason}\n"

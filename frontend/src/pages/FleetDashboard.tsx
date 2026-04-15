@@ -84,6 +84,12 @@ export default function FleetDashboard() {
               </option>
             ))}
           </select>
+          <button
+            onClick={() => navigate("/query")}
+            className="border border-gray-300 px-4 py-1.5 rounded-md text-sm font-medium hover:bg-gray-50"
+          >
+            Ask AI
+          </button>
           {canCompare && (
             <button
               onClick={() =>

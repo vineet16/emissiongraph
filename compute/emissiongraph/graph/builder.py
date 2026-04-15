@@ -255,6 +255,89 @@ def build_graph(
     return G
 
 
+def build_graph_from_headlines(
+    headlines: "HeadlineMetrics",
+    cargo_measurements: list[Measurement] | None = None,
+) -> nx.MultiDiGraph:
+    """Build the emissions graph from verified headline metrics (from 305-4).
+
+    This produces correct emission values that match the workbook author's
+    own calculations, rather than recomputing from quantities × factors.
+    """
+    from emissiongraph.ingestion.emission_parser import HeadlineMetrics
+
+    G = nx.MultiDiGraph()
+    h = headlines
+    port_id = h.port_id
+    fy = h.fy
+
+    # --- Port node ---
+    port_nid = _node_id("port", port_id)
+    G.add_node(port_nid, type=NodeType.PORT.value, port_id=port_id,
+                source_measurement_ids=[], computed_from=[])
+
+    # --- FiscalPeriod node ---
+    fp_nid = _node_id("fp", port_id, fy)
+    G.add_node(fp_nid, type=NodeType.FISCAL_PERIOD.value,
+                port_id=port_id, fy=fy,
+                source_measurement_ids=[], computed_from=[])
+    G.add_edge(port_nid, fp_nid, type=EdgeType.OPERATES_IN.value)
+
+    # --- Cargo throughput ---
+    cargo_nid = _node_id("cargo", port_id, fy)
+    cargo_mids = [m.id for m in (cargo_measurements or [])]
+    G.add_node(cargo_nid, type=NodeType.CARGO_THROUGHPUT.value,
+                port_id=port_id, fy=fy, quantity=h.cargo_mt, unit="MT",
+                source_measurement_ids=cargo_mids, computed_from=[])
+    G.add_edge(fp_nid, cargo_nid, type=EdgeType.HANDLED.value)
+
+    # --- Emission contributions from headline metrics ---
+    emission_contrib_nids = []
+    scope1_components = [
+        ("Diesel", "stationary", h.scope1_diesel_stationary_tco2e),
+        ("Diesel", "mobile", h.scope1_diesel_mobile_tco2e),
+        ("Petrol", None, h.scope1_petrol_tco2e),
+        ("HFHSD", None, h.scope1_hfhsd_ifo_tco2e),
+        ("OtherFuels", None, h.scope1_other_fuels_tco2e),
+    ]
+
+    for fuel_type, sub_type, emissions in scope1_components:
+        sub_label = str(sub_type) if sub_type else "None"
+        emc_nid = _node_id("emission_contrib", port_id, fy, fuel_type, sub_label)
+        G.add_node(emc_nid, type=NodeType.EMISSION_CONTRIBUTION.value,
+                    port_id=port_id, fy=fy,
+                    fuel_type=fuel_type, sub_type=sub_type,
+                    quantity=emissions, unit="tCO2e",
+                    scope="scope1",
+                    source_measurement_ids=[], computed_from=[fp_nid])
+        G.add_edge(fp_nid, emc_nid, type=EdgeType.PRODUCES_EMISSION.value)
+        emission_contrib_nids.append(emc_nid)
+
+    # Scope 2: Electricity
+    elec_nid = _node_id("emission_contrib_s2", port_id, fy, "Electricity", "None")
+    G.add_node(elec_nid, type=NodeType.EMISSION_CONTRIBUTION.value,
+                port_id=port_id, fy=fy,
+                fuel_type="Electricity", sub_type=None,
+                quantity=h.scope2_electricity_tco2e, unit="tCO2e",
+                scope="scope2",
+                source_measurement_ids=[], computed_from=[fp_nid])
+    G.add_edge(fp_nid, elec_nid, type=EdgeType.PRODUCES_EMISSION.value)
+    emission_contrib_nids.append(elec_nid)
+
+    # --- Intensity metric ---
+    if h.cargo_mt > 0:
+        ei = h.total_emissions_tco2e / h.cargo_mt
+        ei_nid = _node_id("intensity_emission", port_id, fy)
+        G.add_node(ei_nid, type=NodeType.INTENSITY_METRIC.value,
+                    port_id=port_id, fy=fy,
+                    metric="emission_intensity",
+                    quantity=ei, unit="tCO2e/MT",
+                    source_measurement_ids=[],
+                    computed_from=emission_contrib_nids + [cargo_nid])
+
+    return G
+
+
 def graph_hash(G: nx.MultiDiGraph) -> str:
     """Deterministic hash of the graph. Spec: sort_keys=True in serialization."""
     data = nx.node_link_data(G)

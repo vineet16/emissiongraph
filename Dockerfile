@@ -20,6 +20,8 @@ COPY compute/ compute/
 # Copy built frontend
 COPY --from=frontend-build /app/frontend/dist frontend/dist
 
-EXPOSE 8000
+# Railway sets PORT dynamically; default to 8000
+ENV PORT=8000
+EXPOSE ${PORT}
 
-CMD ["uvicorn", "emissiongraph.api.routes:app", "--host", "0.0.0.0", "--port", "8000", "--app-dir", "compute"]
+CMD uvicorn emissiongraph.api.routes:app --host 0.0.0.0 --port ${PORT} --app-dir compute

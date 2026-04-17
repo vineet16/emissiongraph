@@ -473,9 +473,9 @@ async def query_llm(req: QueryRequest):
             ("Petrol(S1)", h.scope1_petrol_tco2e),
             ("OtherFuels(S1)", h.scope1_other_fuels_tco2e),
         ]
-        breakdown_abs = ", ".join(f"{n}: {v:.2f} tCO2e" for n, v in components if v > 0)
+        breakdown_abs = ", ".join(f"{n}: {v:.2f} tCO2e" for n, v in components)
         breakdown_per_mt = ", ".join(
-            f"{n}: {v/c*1000:.4f} kg/MT" for n, v in components if v > 0
+            f"{n}: {v/c*1000:.4f} kg/MT" for n, v in components
         )
 
         # Electricity source breakdown (thermal vs renewable MWH)
